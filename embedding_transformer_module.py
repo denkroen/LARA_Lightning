@@ -4,42 +4,33 @@ from torch import nn, optim
 import pytorch_lightning as pl
 import torchmetrics
 from torchmetrics import Metric
-from nn_tcnn_convolutions import TCNNConvBlock
-from nn_tcnn_classificator import ClassificationHead
+from nn_transformer import TransformerEncoderM
 import numpy as np
 
-from utils import efficient_distance, compute_feature_map_size_tcnn, reader_att_rep
+from utils import efficient_distance, select_embedding_generator
 
-class TCNN(pl.LightningModule):
-    def __init__(self, learning_rate, num_filters, filter_size, mode, num_attributes, num_classes, window_length, sensor_channels, path_attributes):
+class EmbeddingTransformer(pl.LightningModule):
+    def __init__(self, learning_rate, num_filters, filter_size, mode, num_attributes, num_classes, window_length, sensor_channels, path_attributes, generator, n_trans_layers, n_trans_hidden_neurons, embedding_size):
         super().__init__()
-        #TODO: move some functions to utils.py, use nn_tcnn.py as network
+
+
+        #TODO: rework training methods, add embedding rotation in generator modules
         self.lr = learning_rate #def schedule
 
-        latent_size = compute_feature_map_size_tcnn(0,window_length,sensor_channels,filter_size) 
+        #embedding generator
+        self.embedding_generator = select_embedding_generator(generator, window_length,sensor_channels, filter_size, num_classes, num_filters, embedding_size)
+        embedding_channels = self.embedding_generator.get_embedding_size()
 
-        self.mode = mode
+        #transformer
+        self.transformer = TransformerEncoderM(embedding_channels, window_length, n_trans_layers, n_trans_hidden_neurons)
 
-        if self.mode == "attribute":
-            self.loss = nn.BCELoss()
-            output_neurons = num_attributes
-
-            # load attribute mapping
-            self.attr = reader_att_rep(path_attributes) 
-            for attr_idx in range(self.attr.shape[0]):
-                self.attr[attr_idx, 1:] = self.attr[attr_idx, 1:] / np.linalg.norm(self.attr[attr_idx, 1:])
-
-            self.atts = torch.from_numpy(self.attr).type(dtype=torch.FloatTensor)
-            self.atts = self.atts.type(dtype=torch.cuda.FloatTensor)
-
-        elif self.mode == "classification":
-            self.loss_shape = nn.CrossEntropyLoss()
-            output_neurons = num_classes
+        #classificator
+        self.activation_function = nn.GELU()
+        self.imu_head = nn.Sequential(nn.LayerNorm(embedding_channels), nn.Linear(embedding_channels, embedding_channels//4),
+                                      self.activation_function, nn.Dropout(0.1), nn.Linear(embedding_channels//4, num_classes))
+        self.softmax = nn.Softmax()
 
 
-
-        self.conv = TCNNConvBlock(1, num_filters, filter_size)
-        self.classificator = ClassificationHead(latent_size, output_neurons, [128,128])
 
         self.accuracy = torchmetrics.Accuracy(
             task="multiclass", num_classes=num_classes
@@ -52,14 +43,13 @@ class TCNN(pl.LightningModule):
 
 
     def forward(self, x):
-        x = self.conv.forward(x)
-        x = x.view(x.size()[0], x.size()[1], x.size()[2])
-        x = self.classificator.forward(x)
 
-        if self.mode == "attribute":
-            x = F.sigmoid(x)
-        elif self.mode == "classification":
-            x = F.softmax(x)
+        x = self.embedding_generator.forward(x)
+        x = self.transformer.forward(x)
+        x = self.imu_head.forward(x)
+
+
+
 
         return x
 
